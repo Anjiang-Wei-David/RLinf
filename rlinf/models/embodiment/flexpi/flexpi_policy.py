@@ -239,12 +239,22 @@ class FlexPiPolicy(BasePolicy, nn.Module):
 
     @staticmethod
     def _as_internal(obs: dict) -> dict:
+        """Pick the image the DSRL encoders see: the env's 64x64 view when present.
+
+        ``extra_view_images`` [B, 1, 64, 64, 3] is what RoboLabEnv provides and
+        what replay transitions keep; ``main_images`` is the fallback so the
+        encoders also work on a raw composite.
+        """
         if "images" in obs:
             return obs
+        small = obs.get("extra_view_images")
+        if small is not None:
+            return {"images": [small[:, 0]], "states": obs["states"]}
         if "main_images" in obs:
             return {"images": [obs["main_images"]], "states": obs["states"]}
         raise ValueError(
-            f"Invalid obs format: {list(obs)}. Expected 'images' or 'main_images'."
+            f"Invalid obs format: {list(obs)}. "
+            "Expected 'images', 'extra_view_images' or 'main_images'."
         )
 
     # ---------------------------------------------------------------- DSRL
@@ -415,7 +425,10 @@ class FlexPiPolicy(BasePolicy, nn.Module):
         result = {
             "forward_inputs": forward_inputs,
             "prev_logprobs": noise_logprob.detach().to(torch.float32),
-            "prev_values": None,
+            # SAC bootstraps a truncated chunk from next_obs inside its TD
+            # target, so the reward-level bootstrap the env worker adds on
+            # truncation must be 0 or the value is counted twice.
+            "prev_values": torch.zeros(B, 1, dtype=torch.float32),
         }
         return actions, result
 

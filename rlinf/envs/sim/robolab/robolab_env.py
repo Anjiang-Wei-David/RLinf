@@ -30,6 +30,7 @@ score plus a terminal bonus; the parent then sees an ordinary
 from __future__ import annotations
 
 import torch
+from omegaconf import OmegaConf, open_dict
 
 from rlinf.envs.sim.isaaclab.isaaclab_env import IsaaclabBaseEnv
 
@@ -95,9 +96,10 @@ class _ShapedRewardEnv:
         # bookkeeping that reset_eval_state() clears for all envs.
         env._has_stepped = False
         try:
-            out = env.reset(seed=seed, env_ids=env_ids)
+            obs, info = env.reset(seed=seed, env_ids=env_ids)
         finally:
             env._has_stepped = True
+        out = (self._with_instruction(obs), info)
         env._frozen_envs[env_ids] = False
         env._pre_step_frozen[env_ids] = False
         for eid in env_ids.tolist():
@@ -106,8 +108,16 @@ class _ShapedRewardEnv:
         self._prev_score[env_ids] = 0.0  # the state machines were reset
         return out
 
+    def _with_instruction(self, obs):
+        # The benchmark's own resolved instruction (task class + instruction_type)
+        # is the prompt the policy was evaluated with; carry it with the obs.
+        obs = dict(obs)
+        obs["instruction"] = str(self.env.cfg.instruction)
+        return obs
+
     def step(self, action):
         obs, _zero_reward, terminated, truncated, info = self.env.step(action)
+        obs = self._with_instruction(obs)
         # Snapshot RoboLab took before this step: envs that held state.
         frozen = self.env._pre_step_frozen
         # An env RoboLab reset itself during this step (a termination within
@@ -140,17 +150,31 @@ class RoboLabEnv(IsaaclabBaseEnv):
         env_type: robolab
         init_params:
           id: MustardInLeftBinTask         # task class name from robolab/tasks/benchmark
-          task_description: "Put the mustard in the left bin"
+          task_description: "Put the mustard in the left bin"   # fallback; the benchmark's own text is used
           success_bonus: 1.0
           instruction_type: default
         max_episode_steps: 900
         seed: 0
+        override_cfgs:                     # optional: one entry per env-worker rank
+          - init_params: {id: BowlInBinTask}
+          - init_params: {id: ReorientRedMugTask}
+
+    With ``override_cfgs`` the env worker gives rank ``i`` its entry as
+    ``cfg.override_cfg``, which is merged over this config before the task is
+    created, so one job can train several tasks with one env worker each.
 
     The cameras are the DROID ``WRIST_LEFT_RIGHT_HEAD`` preset, which is what
     FlexPi was evaluated with; ``_wrap_obs`` composes them into the same single
     frame the RoboLab cosmos3 client sends (wrist on top, left|right at half
     resolution below) so the policy sees exactly its serving input.
     """
+
+    def __init__(self, cfg, num_envs, seed_offset, total_num_processes, worker_info):
+        override = cfg.get("override_cfg", None)
+        if override:
+            with open_dict(cfg):
+                cfg = OmegaConf.merge(cfg, override)
+        super().__init__(cfg, num_envs, seed_offset, total_num_processes, worker_info)
 
     def _make_env_function(self):
         task_name = self.isaaclab_env_id
@@ -212,12 +236,26 @@ class RoboLabEnv(IsaaclabBaseEnv):
 
         prop = obs["proprio_obs"]
         states = torch.cat([prop["arm_joint_pos"], prop["gripper_pos"]], dim=-1)
+        # A 64x64 copy of the composite for the DSRL encoders. It is the only
+        # image the actor needs, so replay transitions can keep just this view
+        # (rollout.transition_obs_keys) instead of the full-resolution frames.
+        small = torch.nn.functional.interpolate(
+            composite.permute(0, 3, 1, 2).float(),
+            size=(64, 64),
+            mode="bilinear",
+            align_corners=False,
+        )
+        small = (
+            small.round().clamp(0, 255).to(torch.uint8).permute(0, 2, 3, 1).unsqueeze(1)
+        )
 
+        instruction = obs.get("instruction", self.task_description)
         return {
             "main_images": composite,
-            "task_descriptions": [self.task_description] * self.num_envs,
+            "task_descriptions": [instruction] * self.num_envs,
             "states": states,
             "wrist_images": wrist,
+            "extra_view_images": small,  # [B, 1, 64, 64, 3]
         }
 
     def _record_metrics(self, step_reward, terminations, infos):
@@ -242,6 +280,9 @@ class RoboLabEnv(IsaaclabBaseEnv):
         ].clamp(min=1)
         if isinstance(infos, dict) and "subtask_score" in infos:
             episode_info["subtask_score"] = infos["subtask_score"].clone()
+        # One env worker runs one task, so a task-named copy of the success
+        # metric gives per-task curves when several tasks train in one job.
+        episode_info[f"success_once/{self.isaaclab_env_id}"] = self.success_once.clone()
         infos["episode"] = episode_info
         return infos
 
