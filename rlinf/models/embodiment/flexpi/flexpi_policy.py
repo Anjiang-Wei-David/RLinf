@@ -56,7 +56,9 @@ from rlinf.models.embodiment.modules.compact_encoders import (
 )
 from rlinf.models.embodiment.modules.gaussian_policy import GaussianPolicy
 
-_DSRL_DTYPE = torch.bfloat16
+# The heads are small enough to train in fp32; in bf16 Adam's 1e-4 steps are
+# below the spacing of any weight above ~0.03 and the std head never learns.
+_DSRL_DTYPE = torch.float32
 
 
 def _load_serving_module(eval_dir: str):

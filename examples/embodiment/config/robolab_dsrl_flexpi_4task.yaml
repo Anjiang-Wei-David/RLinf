@@ -225,7 +225,7 @@ actor:
   model:
     model_type: flexpi
     model_path: ${actor.model.flexpi.ckpt}
-    precision: bf16
+    precision: fp32   # the trained heads; FlexPi itself runs bf16 on the rollout side
     is_lora: False
     load_to_device: False
     num_action_chunks: 32
