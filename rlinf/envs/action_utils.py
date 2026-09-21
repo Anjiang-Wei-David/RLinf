@@ -393,6 +393,10 @@ def prepare_actions(
             raw_chunk_actions=raw_chunk_actions,
             model_type=model_type,
         )
+    elif env_type == SupportedEnvType.ROBOLAB:
+        # RoboLab is an IsaacLab env: joint-position targets as a float tensor,
+        # which IsaacLab moves to the simulation device itself.
+        chunk_actions = torch.as_tensor(raw_chunk_actions, dtype=torch.float32)
     elif env_type == SupportedEnvType.ROBOCASA365:
         chunk_actions = prepare_actions_for_robocasa(
             raw_chunk_actions=raw_chunk_actions,

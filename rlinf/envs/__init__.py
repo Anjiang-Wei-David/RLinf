@@ -28,6 +28,7 @@ class SupportedEnvType(Enum):
     LIBERO = "libero"
     ROBOTWIN = "robotwin"
     ISAACLAB = "isaaclab"
+    ROBOLAB = "robolab"
     METAWORLD = "metaworld"
     BEHAVIOR = "behavior"
     CALVIN = "calvin"
@@ -110,6 +111,12 @@ def get_env_cls(env_type: str, env_cfg=None):
         from rlinf.envs.sim.robotwin.robotwin_env import RoboTwinEnv
 
         return RoboTwinEnv
+    elif env_type == SupportedEnvType.ROBOLAB:
+        # RoboLab is an IsaacLab benchmark; the task is selected by its class
+        # name (e.g. ``MustardInLeftBinTask``) through env_cfg.init_params.id.
+        from rlinf.envs.sim.robolab import RoboLabEnv
+
+        return RoboLabEnv
     elif env_type == SupportedEnvType.ISAACLAB:
         from rlinf.envs.sim.isaaclab import REGISTER_ISAACLAB_ENVS
 

@@ -47,8 +47,14 @@ from rlinf.utils.utils import clear_memory, collect_param_names_need_sync
 from rlinf.workers.actor.embodied_fsdp_actor_worker import EmbodiedFSDPActor
 
 
-def _openpi_is_dsrl(cfg: DictConfig) -> bool:
-    """True when YAML selects DSRL via ``openpi.task=dsrl`` or the legacy flag."""
+def _is_dsrl(cfg: DictConfig) -> bool:
+    """True when the actor model trains a noise policy over a frozen flow model.
+
+    Any model declares it with ``actor.model.use_dsrl``; OpenPI also keeps its
+    own ``openpi.use_dsrl`` flag and the ``openpi.task=dsrl`` spelling.
+    """
+    if bool(cfg.actor.model.get("use_dsrl", False)):
+        return True
     openpi_cfg = cfg.actor.model.get("openpi", {}) or {}
     if bool(openpi_cfg.get("use_dsrl", False)):
         return True
@@ -117,7 +123,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             self.target_model.requires_grad_(False)
             self.target_model_initialized = True
 
-        self.use_dsrl = _openpi_is_dsrl(self.cfg)
+        self.use_dsrl = _is_dsrl(self.cfg)
         use_dsrl = self.use_dsrl
         if use_dsrl:
             # DSRL: separate actor/critic encoders into different optimizer groups
@@ -148,10 +154,14 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             dtype=self.torch_dtype,
         )
         if alpha_type != "fixed_alpha":
+            # Resolve the default lazily: a model that sets target_entropy
+            # explicitly (e.g. DSRL, whose entropy is over the noise) need not
+            # declare an action_dim.
             self.target_entropy = self.cfg.algorithm.entropy_tuning.get(
-                "target_entropy",
-                -self.cfg.actor.model.action_dim,
+                "target_entropy", None
             )
+            if self.target_entropy is None:
+                self.target_entropy = -self.cfg.actor.model.action_dim
 
             self.alpha_optimizer = torch.optim.Adam(
                 self.entropy_temp.parameters(),
@@ -356,7 +366,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         use_crossq = self.cfg.algorithm.get("q_head_type", "default") == "crossq"
         bootstrap_type = self.cfg.algorithm.get("bootstrap_type", "standard")
         agg_q = self.cfg.algorithm.get("agg_q", "min")
-        use_dsrl = _openpi_is_dsrl(self.cfg)
+        use_dsrl = _is_dsrl(self.cfg)
         if use_dsrl:
             num_action_chunks = self.cfg.actor.model.get("num_action_chunks", 1)
             discount = self.cfg.algorithm.gamma**num_action_chunks

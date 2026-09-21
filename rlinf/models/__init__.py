@@ -64,6 +64,11 @@ def _register_builtin_models():
 
         return get_model(cfg, torch_dtype)
 
+    def _build_flexpi(cfg: DictConfig, torch_dtype):
+        from rlinf.models.embodiment.flexpi import get_model
+
+        return get_model(cfg, torch_dtype)
+
     def _build_molmoact2(cfg: DictConfig, torch_dtype):
         from rlinf.models.embodiment.molmoact2 import get_model
 
@@ -198,6 +203,12 @@ def _register_builtin_models():
     register_model(
         SupportedModel.OPENVLA_OFT.value,
         _build_openvla_oft,
+        category="embodied",
+        force=True,
+    )
+    register_model(
+        SupportedModel.FLEXPI.value,
+        _build_flexpi,
         category="embodied",
         force=True,
     )

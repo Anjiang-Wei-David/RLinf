@@ -87,6 +87,7 @@ SupportedModel.QWEN3_VL = SupportedModel.register("qwen3_vl", force=True)
 SupportedModel.QWEN3_MOE = SupportedModel.register("qwen3_moe", force=True)
 SupportedModel.OPENVLA = SupportedModel.register("openvla", force=True)
 SupportedModel.OPENVLA_OFT = SupportedModel.register("openvla_oft", force=True)
+SupportedModel.FLEXPI = SupportedModel.register("flexpi", force=True)
 SupportedModel.MOLMOACT2 = SupportedModel.register("molmoact2", force=True)
 SupportedModel.OPENPI = SupportedModel.register("openpi", force=True)
 SupportedModel.OPENPI_RLINF = SupportedModel.register("openpi_rlinf", force=True)
@@ -135,6 +136,7 @@ EMBODIED_MODEL = set(
     {
         SupportedModel.OPENVLA,
         SupportedModel.OPENVLA_OFT,
+        SupportedModel.FLEXPI,
         SupportedModel.OPENPI,
         SupportedModel.OPENPI_RLINF,
         SupportedModel.STARVLA,
