@@ -312,6 +312,22 @@ def test_trajectory_chunks_keep_top_level_fields_aligned():
     ] == expected_ids
 
 
+def test_append_transitions_leaves_caller_obs_intact():
+    # The env worker reuses the obs dict it passes here as the next epoch's
+    # bootstrap observation, where the policy still needs its prompt.
+    curr_obs = {"states": torch.zeros(2, 3), "task_descriptions": ["a", "b"]}
+    next_obs = {"states": torch.ones(2, 3), "task_descriptions": ["a", "b"]}
+    builder = EmbodiedTrajectoryBuilder()
+
+    builder.append_transitions(curr_obs, next_obs)
+
+    assert curr_obs["task_descriptions"] == ["a", "b"]
+    assert next_obs["task_descriptions"] == ["a", "b"]
+    assert "task_descriptions" not in builder.curr_obs[0]
+    assert "task_descriptions" not in builder.next_obs[0]
+    assert builder.curr_obs[0]["states"] is curr_obs["states"]
+
+
 def test_trajectory_split_returns_requested_number_of_chunks():
     trajectories = _make_trajectory_builder(2).to_splited_trajectories(4)
 

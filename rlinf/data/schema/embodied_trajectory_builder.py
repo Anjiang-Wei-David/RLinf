@@ -152,12 +152,15 @@ class EmbodiedTrajectoryBuilder:
 
     def append_transitions(self, curr_obs=None, next_obs=None):
         assert curr_obs is not None and next_obs is not None
-        if "task_descriptions" in curr_obs:
-            curr_obs.pop("task_descriptions")
-        if "task_descriptions" in next_obs:
-            next_obs.pop("task_descriptions")
-        self.curr_obs.append(curr_obs)
-        self.next_obs.append(next_obs)
+        # Text prompts are not part of a transition. Drop them from our copy
+        # only: the env worker keeps the same obs dict as the next epoch's
+        # bootstrap observation, and the policy still needs its prompt there.
+        self.curr_obs.append(
+            {k: v for k, v in curr_obs.items() if k != "task_descriptions"}
+        )
+        self.next_obs.append(
+            {k: v for k, v in next_obs.items() if k != "task_descriptions"}
+        )
 
     def clear(self):
         self.actions.clear()
