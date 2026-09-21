@@ -147,11 +147,16 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         alpha_type = self.cfg.algorithm.entropy_tuning.get(
             "alpha_type", "softplus"
         )  # supported type: ["softplus","exp","fixed_alpha"]
+        # The temperature is one scalar trained with a tiny learning rate; in
+        # bf16 an Adam step of 3e-4 on a value near 0.5 is below the spacing
+        # between representable numbers and rounds away, so alpha never moves.
+        # Keep it in fp32 whatever the model dtype; it broadcasts into the
+        # bf16 losses without cost.
         self.entropy_temp = EntropyTemperature(
             initial_alpha=self.cfg.algorithm.entropy_tuning.get("initial_alpha", 0.01),
             alpha_type=alpha_type,
             device=self.device,
-            dtype=self.torch_dtype,
+            dtype=torch.float32,
         )
         if alpha_type != "fixed_alpha":
             # Resolve the default lazily: a model that sets target_entropy
