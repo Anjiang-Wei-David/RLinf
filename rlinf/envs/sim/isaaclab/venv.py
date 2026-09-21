@@ -12,12 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import queue
+import traceback
 from multiprocessing.connection import Connection
 
 import torch
 import torch.multiprocessing as mp
 
 from .utils import CloudpickleWrapper
+
+
+class _ChildError:
+    """An exception raised inside the simulator process, carried to the parent."""
+
+    def __init__(self, formatted: str):
+        self.formatted = formatted
 
 
 def _torch_worker(
@@ -41,16 +50,24 @@ def _torch_worker(
                 break
             if cmd == "reset":
                 reset_index, reset_seed = reset_idx_queue.get()
-                if reset_index is None:
-                    reset_result = isaac_env.reset(seed=reset_seed)
-                else:
-                    reset_result = isaac_env.reset(
-                        seed=reset_seed, env_ids=reset_index.to(device)
-                    )
+                try:
+                    if reset_index is None:
+                        reset_result = isaac_env.reset(seed=reset_seed)
+                    else:
+                        reset_result = isaac_env.reset(
+                            seed=reset_seed, env_ids=reset_index.to(device)
+                        )
+                except Exception:
+                    obs_queue.put(_ChildError(traceback.format_exc()))
+                    break
                 obs_queue.put(reset_result)
             elif cmd == "step":
                 input_action = action_queue.get()
-                step_result = isaac_env.step(input_action)
+                try:
+                    step_result = isaac_env.step(input_action)
+                except Exception:
+                    obs_queue.put(_ChildError(traceback.format_exc()))
+                    break
                 obs_queue.put(step_result)
             elif cmd == "close":
                 isaac_env.close()
@@ -93,10 +110,32 @@ class SubProcIsaacLabEnv:
         self.isaac_lab_process.start()
         self.child_remote.close()
 
+    def _recv(self):
+        """Next result from the simulator process.
+
+        Raises instead of blocking forever when the simulator raised (the
+        error is forwarded) or died without answering (a crash or a kill).
+        """
+        while True:
+            try:
+                result = self.obs_queue.get(timeout=5.0)
+            except queue.Empty:
+                if self.isaac_lab_process.is_alive():
+                    continue
+                raise RuntimeError(
+                    "IsaacLab simulator process died without a result "
+                    f"(exit code {self.isaac_lab_process.exitcode})"
+                )
+            if isinstance(result, _ChildError):
+                raise RuntimeError(
+                    "IsaacLab simulator process raised:\n" + result.formatted
+                )
+            return result
+
     def reset(self, seed=None, env_ids=None):
         self.parent_remote.send("reset")
         self.reset_idx.put((env_ids, seed))
-        obs, info = self.obs_queue.get()
+        obs, info = self._recv()
         return obs, info
 
     def step(self, action: torch.Tensor):
@@ -105,8 +144,7 @@ class SubProcIsaacLabEnv:
         """
         self.parent_remote.send("step")
         self.action_queue.put(action)
-        env_step_result = self.obs_queue.get()
-        return env_step_result
+        return self._recv()
 
     def close(self):
         self.parent_remote.send("close")
