@@ -46,12 +46,17 @@ class _ShapedRewardEnv:
     is untouched, so a policy trained on this reward is still scored by the
     benchmark's rule.
 
-    Frozen envs (already terminated within the episode) keep their last score,
-    so their delta is 0 until reset, and ``terminated`` stays true on every
-    frozen frame, so the bonus is paid once, on the frame success first
-    appears. On that frame the recorder has already run its final step with
-    ``is_complete()`` true, so the score is 1.0 on both sides and the delta is
-    0 -- the bonus is the only signal there.
+    RoboLab is an evaluation benchmark: a terminated env is *frozen* (zero
+    action, state held, ``terminated`` stays true) rather than reset, and its
+    ``_reset_idx`` skips frozen envs even on an explicit reset. Two things
+    follow. Frozen frames get reward 0, so the bonus is paid once, on the
+    frame success first appears, and score drift on a held scene is ignored.
+    And ``reset(env_ids)`` performs a real reset of those envs, so RLinf's
+    chunk-end auto-reset starts a new episode.
+
+    The score is read from ``term.infos``, which the recorder writes in
+    ``record_post_step`` before IsaacLab's in-step reset logic runs, so on the
+    success frame it is the finished episode's 1.0.
     """
 
     def __init__(self, env, success_bonus: float):
@@ -72,9 +77,6 @@ class _ShapedRewardEnv:
                 "that the task defines `subtasks`."
             )
         self._prev_score = torch.zeros(self.num_envs, device=self.device)
-        self._prev_success = torch.zeros(
-            self.num_envs, dtype=torch.bool, device=self.device
-        )
 
     def _scores(self) -> torch.Tensor:
         return torch.tensor(
@@ -83,32 +85,41 @@ class _ShapedRewardEnv:
         )
 
     def reset(self, seed=None, env_ids=None):
-        out = (
-            self.env.reset(seed=seed)
-            if env_ids is None
-            else self.env.reset(seed=seed, env_ids=env_ids)
-        )
-        score = self._scores()
         if env_ids is None:
-            self._prev_score = score
-            self._prev_success[:] = False
-        else:
-            self._prev_score[env_ids] = score[env_ids]
-            self._prev_success[env_ids] = False
+            env_ids = torch.arange(self.num_envs, device=self.device)
+        env_ids = torch.as_tensor(env_ids, device=self.device)
+        env = self.env
+        # RobolabEnv._reset_idx freezes every env it is handed once stepping
+        # has begun, so an explicit reset must take its initial-reset path
+        # (a real IsaacLab reset plus predicate state), then clear the frozen
+        # bookkeeping that reset_eval_state() clears for all envs.
+        env._has_stepped = False
+        try:
+            out = env.reset(seed=seed, env_ids=env_ids)
+        finally:
+            env._has_stepped = True
+        env._frozen_envs[env_ids] = False
+        env._pre_step_frozen[env_ids] = False
+        for eid in env_ids.tolist():
+            env._env_results.pop(eid, None)
+            env._env_term_step.pop(eid, None)
+        self._prev_score[env_ids] = 0.0  # the state machines were reset
         return out
 
     def step(self, action):
         obs, _zero_reward, terminated, truncated, info = self.env.step(action)
+        # Snapshot RoboLab took before this step: envs that held state.
+        frozen = self.env._pre_step_frozen
+        # An env RoboLab reset itself during this step (a termination within
+        # its first two frames is treated as a physics artifact) starts over.
+        restarted = self.env.episode_length_buf == 0
         score = self._scores()
-        success = terminated.to(
-            torch.bool
-        )  # RobolabEnv: terminated == the success DoneTerm
-        newly_succeeded = success & ~self._prev_success
-        reward = (score - self._prev_score) + self.success_bonus * newly_succeeded.to(
+        success = terminated.to(torch.bool)
+        reward = (score - self._prev_score) + self.success_bonus * success.to(
             score.dtype
         )
-        self._prev_score = score
-        self._prev_success = success
+        reward = torch.where(frozen | restarted, torch.zeros_like(reward), reward)
+        self._prev_score = torch.where(restarted, torch.zeros_like(score), score)
         info = dict(info) if info is not None else {}
         info["success"] = success
         info["subtask_score"] = score
