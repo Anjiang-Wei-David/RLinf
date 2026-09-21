@@ -19,7 +19,7 @@ from typing import Any
 
 import numpy as np
 import torch
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, OmegaConf, open_dict
 
 from rlinf.algorithms.registry import calculate_adv_and_returns
 from rlinf.algorithms.rlt.transition import update_rlt_transitions
@@ -58,6 +58,13 @@ from rlinf.utils.utils import (
 )
 
 
+def _to_plain_dict(cfg) -> dict:
+    """Resolve an OmegaConf node to a dict; a plain dict (e.g. a default) passes through."""
+    if OmegaConf.is_config(cfg):
+        return OmegaConf.to_container(cfg, resolve=True)
+    return dict(cfg)
+
+
 class EnvWorker(Worker):
     # Class-level default so the observation send path is safe even when the
     # instance is built without running ``__init__`` (e.g. ``object.__new__`` in
@@ -83,6 +90,10 @@ class EnvWorker(Worker):
         self._component_placement = HybridComponentPlacement(cfg, Cluster())
 
         self.collect_transitions = self.cfg.rollout.get("collect_transitions", False)
+        # Obs keys a replay transition keeps; None keeps every key. Lets an env
+        # that emits large frames for the rollout policy store only the small
+        # views the actor trains on.
+        self.transition_obs_keys = self.cfg.rollout.get("transition_obs_keys", None)
         self.collect_prev_infos = self.cfg.rollout.get("collect_prev_infos", True)
         self.stage_num = self.cfg.rollout.pipeline_stage_num
         self.enable_rlt = OmegaConf.select(
@@ -301,17 +312,16 @@ class EnvWorker(Worker):
                     f"{len(train_override_cfgs)=} > {self._rank=}"
                 )
 
-                general_train_override_cfg = OmegaConf.to_container(
-                    self.cfg.env.train.get("override_cfg", {}), resolve=True
+                general_train_override_cfg = _to_plain_dict(
+                    self.cfg.env.train.get("override_cfg", {})
                 )
-                override_cfg = OmegaConf.to_container(
-                    train_override_cfgs[self._rank], resolve=True
-                ).copy()
+                override_cfg = _to_plain_dict(train_override_cfgs[self._rank])
 
                 base_cfg = {}
                 base_cfg = update_nested_cfg(base_cfg, general_train_override_cfg)
                 base_cfg = update_nested_cfg(base_cfg, override_cfg)
-                setattr(self.cfg.env.train, "override_cfg", OmegaConf.create(base_cfg))
+                with open_dict(self.cfg.env.train):
+                    self.cfg.env.train.override_cfg = OmegaConf.create(base_cfg)
             self._inject_realworld_reward_cfg(self.cfg.env.train)
         if self.enable_eval:
             eval_override_cfgs = self.cfg.env.eval.get("override_cfgs", None)
@@ -320,20 +330,17 @@ class EnvWorker(Worker):
                     f"{len(eval_override_cfgs)=} > {self._rank=}"
                 )
 
-                general_eval_override_cfg = OmegaConf.to_container(
-                    self.cfg.env.eval.get("override_cfg", {}), resolve=True
+                general_eval_override_cfg = _to_plain_dict(
+                    self.cfg.env.eval.get("override_cfg", {})
                 )
-                eval_override_cfg = OmegaConf.to_container(
-                    eval_override_cfgs[self._rank], resolve=True
-                ).copy()
+                eval_override_cfg = _to_plain_dict(eval_override_cfgs[self._rank])
                 base_eval_cfg = {}
                 base_eval_cfg = update_nested_cfg(
                     base_eval_cfg, general_eval_override_cfg
                 )
                 base_eval_cfg = update_nested_cfg(base_eval_cfg, eval_override_cfg)
-                setattr(
-                    self.cfg.env.eval, "override_cfg", OmegaConf.create(base_eval_cfg)
-                )
+                with open_dict(self.cfg.env.eval):
+                    self.cfg.env.eval.override_cfg = OmegaConf.create(base_eval_cfg)
             self._inject_realworld_reward_cfg(self.cfg.env.eval)
 
     def _init_pipeline_params(self):
@@ -973,6 +980,11 @@ class EnvWorker(Worker):
 
         return env_outputs
 
+    def _transition_obs(self, obs: dict[str, Any]) -> dict[str, Any]:
+        if self.transition_obs_keys is None or not isinstance(obs, dict):
+            return obs
+        return {k: v for k, v in obs.items() if k in self.transition_obs_keys}
+
     def _build_rollout_input_data(self, env_batch: dict[str, Any]) -> dict[str, Any]:
         data = {
             "obs": env_batch["obs"],
@@ -1265,7 +1277,8 @@ class EnvWorker(Worker):
                             else env_output.obs
                         )
                         self.trajectory_builders[stage_id].append_transitions(
-                            curr_obs, next_obs
+                            self._transition_obs(curr_obs),
+                            self._transition_obs(next_obs),
                         )
 
                     env_outputs[stage_id] = env_output
