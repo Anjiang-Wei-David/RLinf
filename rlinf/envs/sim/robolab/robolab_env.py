@@ -316,8 +316,10 @@ class RoboLabEnv(IsaaclabBaseEnv):
         task = self.isaaclab_env_id
         episode_info[f"success_once/{task}"] = self.success_once.clone()
         # Rates over finished episodes: the last 100 and all so far. Constant
-        # across envs, so the mean the runner logs is the rate itself.
-        if self._recent_outcomes:
+        # across envs, so the mean the runner logs is the rate itself. They
+        # describe a continuing training stream; an eval run reports
+        # success_once per episode instead.
+        if self._recent_outcomes and not bool(self.cfg.get("is_eval", False)):
             recent = sum(self._recent_outcomes) / len(self._recent_outcomes)
             overall = self._succeeded / self._finished
             episode_info[f"success_rate_100/{task}"] = torch.full_like(
