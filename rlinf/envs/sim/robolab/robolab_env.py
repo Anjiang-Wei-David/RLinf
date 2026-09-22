@@ -29,6 +29,8 @@ score plus a terminal bonus; the parent then sees an ordinary
 
 from __future__ import annotations
 
+from collections import deque
+
 import torch
 from omegaconf import OmegaConf, open_dict
 
@@ -258,6 +260,35 @@ class RoboLabEnv(IsaaclabBaseEnv):
             "extra_view_images": small,  # [B, 1, 64, 64, 3]
         }
 
+    def _init_metrics(self):
+        super()._init_metrics()
+        # Per-episode outcomes, counted once when an episode first ends, for
+        # rates that are not biased toward the episodes that happen to finish
+        # inside one rollout step (early on those are only the successes:
+        # failures run until the task's time limit).
+        self._episode_done = torch.zeros(self.num_envs, dtype=torch.bool).to(
+            self.device
+        )
+        self._recent_outcomes: deque[bool] = deque(maxlen=100)
+        self._finished = 0
+        self._succeeded = 0
+
+    def _reset_metrics(self, env_idx=None):
+        super()._reset_metrics(env_idx)
+        if env_idx is None:
+            self._episode_done[:] = False
+        else:
+            self._episode_done[env_idx] = False
+
+    def _count_outcomes(self, terminations, truncations):
+        newly_done = (terminations | truncations) & ~self._episode_done
+        if newly_done.any():
+            for ok in (self.success_once | terminations)[newly_done].tolist():
+                self._recent_outcomes.append(bool(ok))
+                self._finished += 1
+                self._succeeded += int(ok)
+            self._episode_done |= newly_done
+
     def _record_metrics(self, step_reward, terminations, infos):
         """Success comes from the task's DoneTerm, not from ``reward > 0``.
 
@@ -282,7 +313,22 @@ class RoboLabEnv(IsaaclabBaseEnv):
             episode_info["subtask_score"] = infos["subtask_score"].clone()
         # One env worker runs one task, so a task-named copy of the success
         # metric gives per-task curves when several tasks train in one job.
-        episode_info[f"success_once/{self.isaaclab_env_id}"] = self.success_once.clone()
+        task = self.isaaclab_env_id
+        episode_info[f"success_once/{task}"] = self.success_once.clone()
+        # Rates over finished episodes: the last 100 and all so far. Constant
+        # across envs, so the mean the runner logs is the rate itself.
+        if self._recent_outcomes:
+            recent = sum(self._recent_outcomes) / len(self._recent_outcomes)
+            overall = self._succeeded / self._finished
+            episode_info[f"success_rate_100/{task}"] = torch.full_like(
+                self.returns, recent
+            )
+            episode_info[f"success_rate_all/{task}"] = torch.full_like(
+                self.returns, overall
+            )
+            episode_info[f"episodes_finished/{task}"] = torch.full_like(
+                self.returns, float(self._finished)
+            )
         infos["episode"] = episode_info
         return infos
 
@@ -295,9 +341,14 @@ class RoboLabEnv(IsaaclabBaseEnv):
         self._elapsed_steps += 1
         truncations = (self.elapsed_steps >= self.cfg.max_episode_steps) | truncations
         dones = terminations | truncations
-        infos = self._record_metrics(
-            step_reward, terminations, infos if isinstance(infos, dict) else {}
-        )
+        infos = infos if isinstance(infos, dict) else {}
+        success = infos.get("success")
+        if success is not None:
+            self.success_once = (
+                self.success_once | success.to(self.success_once.device).bool()
+            )
+        self._count_outcomes(terminations, truncations)
+        infos = self._record_metrics(step_reward, terminations, infos)
         if self.ignore_terminations:
             infos["episode"]["success_at_end"] = terminations
             terminations[:] = False
