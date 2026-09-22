@@ -120,6 +120,7 @@ class FlexPiPolicy(BasePolicy, nn.Module):
         add_q_head: true        # SAC heads; false for PPO
         add_value_head: false   # PPO value head; true for PPO
         eval_sample_noise: false  # eval uses the policy mean; true samples instead
+        noise_scale: 1.0        # latent range = scale * tanh(.)
         num_action_chunks: 32   # FlexPi action horizon; the noise is [32, action_dim]
         action_dim: 8           # arm joints (7) + gripper (1)
         flexpi:
@@ -154,6 +155,10 @@ class FlexPiPolicy(BasePolicy, nn.Module):
         self.action_horizon = int(cfg.num_action_chunks)
         self.action_dim = int(cfg.action_dim)
         self.noise_dim = self.action_horizon * self.action_dim  # 256
+        # Range of the latent handed to FlexPi: tanh output times this scale.
+        # 1.0 keeps it inside the unit cube; larger values give the policy
+        # leverage beyond the prior's typical magnitude.
+        self.noise_scale = float(cfg.get("noise_scale", 1.0))
         # The frozen 5B model is loaded on the first denoising request, so only
         # the rollout worker ever holds it: the SAC actor builds this class
         # twice (model + target) from the same config and never denoises.
@@ -171,8 +176,8 @@ class FlexPiPolicy(BasePolicy, nn.Module):
             input_dim=state_lat + image_lat,
             output_dim=self.noise_dim,
             hidden_dims=hidden,
-            low=None,
-            high=None,
+            low=-self.noise_scale,
+            high=self.noise_scale,
             action_horizon=1,
         ).to(dtype=_DSRL_DTYPE)
         self.actor_image_encoder = LightweightImageEncoder64(
@@ -464,11 +469,14 @@ class FlexPiPolicy(BasePolicy, nn.Module):
         # SquashedNormal = tanh(Independent(Normal)); the Normal is what PPO needs.
         return dist.base_dist.base_dist
 
-    @staticmethod
-    def _tanh_logprobs(normal, pre_tanh: torch.Tensor) -> torch.Tensor:
-        """Per-element log-prob of z = tanh(u) under the squashed Gaussian."""
+    def _tanh_logprobs(self, normal, pre_tanh: torch.Tensor) -> torch.Tensor:
+        """Per-element log-prob of z = scale * tanh(u) under the squashed Gaussian."""
         z = torch.tanh(pre_tanh)
-        return normal.log_prob(pre_tanh) - torch.log(1 - z.pow(2) + 1e-7)
+        return (
+            normal.log_prob(pre_tanh)
+            - torch.log(1 - z.pow(2) + 1e-7)
+            - torch.log(torch.tensor(self.noise_scale, device=pre_tanh.device))
+        )
 
     def default_forward(
         self,
@@ -543,7 +551,7 @@ class FlexPiPolicy(BasePolicy, nn.Module):
         normal = self._noise_normal(images, states)
         deterministic = mode == "eval" and not self.cfg.get("eval_sample_noise", False)
         pre_tanh = normal.loc if deterministic else normal.rsample()
-        noise = torch.tanh(pre_tanh)
+        noise = self.noise_scale * torch.tanh(pre_tanh)
         logprobs = self._tanh_logprobs(normal, pre_tanh)  # [B, noise_dim]
         values = self.value_head(images, states)  # [B, 1]
         outputs = self.sample_actions(env_obs, noise=noise.to(torch.float32))

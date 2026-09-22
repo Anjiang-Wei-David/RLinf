@@ -187,6 +187,7 @@ rollout:
     load_to_device: False
     num_action_chunks: 32
     action_dim: 8
+    noise_scale: 1.0   # latent range = scale * tanh(.)
     add_q_head: False
     add_value_head: True
     flexpi: ${actor.model.flexpi}
@@ -212,6 +213,7 @@ actor:
     # The frozen 5B model is loaded lazily by the process that denoises (the
     # rollout worker); the actor trains only the noise policy and value head.
     action_dim: 8
+    noise_scale: 1.0   # latent range = scale * tanh(.)
     add_value_head: True
     add_q_head: False
     flexpi:

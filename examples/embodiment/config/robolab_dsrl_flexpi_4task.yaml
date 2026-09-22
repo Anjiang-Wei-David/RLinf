@@ -212,6 +212,7 @@ rollout:
     num_action_chunks: 32
     use_dsrl: True
     action_dim: 8
+    noise_scale: 1.0   # latent range = scale * tanh(.)
     flexpi: ${actor.model.flexpi}
     dsrl_state_dim: 8
     dsrl_image_latent_dim: 64
@@ -237,6 +238,7 @@ actor:
     # The frozen 5B model is loaded lazily by the process that denoises (the
     # rollout worker); the actor trains only the DSRL heads on this config.
     action_dim: 8
+    noise_scale: 1.0   # latent range = scale * tanh(.)
     add_value_head: False
     add_q_head: True
     q_head_type: "default"
