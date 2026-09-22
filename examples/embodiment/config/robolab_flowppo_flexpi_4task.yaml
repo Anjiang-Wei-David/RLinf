@@ -77,7 +77,7 @@ runner:
   max_steps: -1
   only_eval: False
   val_check_interval: -1
-  save_interval: 10
+  save_interval: 25   # ~16 GB per checkpoint (fp32 ActionDiT + optimizer)
   resume_dir: null
 
 algorithm:
@@ -86,7 +86,10 @@ algorithm:
   kl_penalty: kl
   group_size: 1
   reward_type: chunk_level     # one transition = one 32-step chunk; reward summed
-  logprob_type: chunk_level    # as in RLinf's OpenPI flow PPO; lr is small enough
+  # Per-element ratios. With 20 denoising steps the injected step's Gaussian
+  # is sharp, and a chunk-level ratio over 256 elements saturated the clip
+  # (smoke 44089: approx_kl 0.4, clip_fraction 0.34-0.48).
+  logprob_type: token_level
   entropy_type: token_level
   adv_type: gae
   loss_type: actor_critic
