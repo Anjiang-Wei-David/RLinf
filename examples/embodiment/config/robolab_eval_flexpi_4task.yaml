@@ -197,6 +197,7 @@ rollout:
     action_dim: 8
     add_q_head: False
     add_value_head: True
+    eval_sample_noise: False   # true: evaluate the stochastic policy instead of its mean
     flexpi: ${actor.model.flexpi}
     dsrl_state_dim: 8
     dsrl_image_latent_dim: 64
