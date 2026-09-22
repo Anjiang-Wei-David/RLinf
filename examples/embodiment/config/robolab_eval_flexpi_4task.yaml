@@ -156,8 +156,9 @@ env:
     ignore_terminations: True
     use_rel_reward: False
     use_step_penalty: False
-    max_episode_steps: 900
-    max_steps_per_rollout_epoch: 900
+    # 28 chunks of 32; the two 900-step tasks lose their last 4 steps.
+    max_episode_steps: 896
+    max_steps_per_rollout_epoch: 896
     is_eval: True
     group_size: 1
     video_cfg:
