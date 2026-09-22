@@ -73,15 +73,52 @@ def _load_serving_module(eval_dir: str):
     return mod
 
 
+class _ValueHead(nn.Module):
+    """V(obs) for PPO: its own encoders over the 64x64 view and proprio, then an MLP."""
+
+    def __init__(self, state_dim, state_latent_dim, image_latent_dim, hidden_dims):
+        super().__init__()
+        self.image_encoder = LightweightImageEncoder64(
+            num_images=1, latent_dim=image_latent_dim, image_size=64
+        )
+        self.state_encoder = CompactStateEncoder(
+            state_dim=state_dim, hidden_dim=state_latent_dim
+        )
+        layers, d = [], state_latent_dim + image_latent_dim
+        for h in hidden_dims:
+            layers += [nn.Linear(d, h), nn.ReLU()]
+            d = h
+        layers.append(nn.Linear(d, 1))
+        self.mlp = nn.Sequential(*layers)
+
+    def forward(self, images: torch.Tensor, states: torch.Tensor) -> torch.Tensor:
+        feat = torch.cat(
+            [self.state_encoder(states), self.image_encoder(images)], dim=-1
+        )
+        return self.mlp(feat)  # [B, 1]
+
+
 class FlexPiPolicy(BasePolicy, nn.Module):
-    """Frozen FlexPi + trainable DSRL noise policy and Q-heads.
+    """Frozen FlexPi + a trainable noise policy over its initial action latent.
+
+    Two training modes share the noise policy (a tanh-squashed Gaussian over
+    the 32x8 latent) and the frozen model; the config picks the heads:
+
+    * SAC / DSRL (``add_q_head: true``, ``use_dsrl: true``): Q-heads over
+      (obs, noise), trained by ``EmbodiedSACFSDPPolicy`` from replay.
+    * PPO (``add_value_head: true``): a value head over obs, trained by
+      ``EmbodiedFSDPActor`` with GAE (``loss_type: actor_critic``). The
+      rollout stores the pre-tanh sample and per-element log-probs, so the
+      ratio is exact and RLinf's ``logprob_type`` aggregation applies.
 
     Config (``actor.model`` / ``rollout.model``)::
 
         model_type: flexpi
-        precision: bf16
+        precision: fp32
         is_lora: false
-        use_dsrl: true          # tells the SAC worker to train the noise policy
+        use_dsrl: true          # SAC only: tells the SAC worker to train the noise policy
+        add_q_head: true        # SAC heads; false for PPO
+        add_value_head: false   # PPO value head; true for PPO
         num_action_chunks: 32   # FlexPi action horizon; the noise is [32, action_dim]
         action_dim: 8           # arm joints (7) + gripper (1)
         flexpi:
@@ -143,20 +180,30 @@ class FlexPiPolicy(BasePolicy, nn.Module):
         self.actor_state_encoder = CompactStateEncoder(
             state_dim=self.dsrl_state_dim, hidden_dim=state_lat
         ).to(dtype=_DSRL_DTYPE)
-        self.critic_image_encoder = LightweightImageEncoder64(
-            num_images=1, latent_dim=image_lat, image_size=64
-        ).to(dtype=_DSRL_DTYPE)
-        self.critic_state_encoder = CompactStateEncoder(
-            state_dim=self.dsrl_state_dim, hidden_dim=state_lat
-        ).to(dtype=_DSRL_DTYPE)
-        self.q_head = CompactMultiQHead(
-            state_dim=state_lat,
-            image_dim=image_lat,
-            action_dim=self.noise_dim,
-            hidden_dims=hidden,
-            num_q_heads=int(cfg.get("dsrl_num_q_heads", 10)),
-            output_dim=1,
-        ).to(dtype=_DSRL_DTYPE)
+        self.add_q_head = bool(cfg.get("add_q_head", True))
+        self.add_value_head = bool(cfg.get("add_value_head", False))
+        if self.add_q_head:
+            self.critic_image_encoder = LightweightImageEncoder64(
+                num_images=1, latent_dim=image_lat, image_size=64
+            ).to(dtype=_DSRL_DTYPE)
+            self.critic_state_encoder = CompactStateEncoder(
+                state_dim=self.dsrl_state_dim, hidden_dim=state_lat
+            ).to(dtype=_DSRL_DTYPE)
+            self.q_head = CompactMultiQHead(
+                state_dim=state_lat,
+                image_dim=image_lat,
+                action_dim=self.noise_dim,
+                hidden_dims=hidden,
+                num_q_heads=int(cfg.get("dsrl_num_q_heads", 10)),
+                output_dim=1,
+            ).to(dtype=_DSRL_DTYPE)
+        if self.add_value_head:
+            self.value_head = _ValueHead(
+                state_dim=self.dsrl_state_dim,
+                state_latent_dim=state_lat,
+                image_latent_dim=image_lat,
+                hidden_dims=hidden,
+            ).to(dtype=_DSRL_DTYPE)
         for name, module in self.named_modules():
             setattr(module, "_fsdp_wrap_name", name.split(".")[-1] if name else name)
         self.global_step = 0
@@ -394,6 +441,63 @@ class FlexPiPolicy(BasePolicy, nn.Module):
         }
 
     # ------------------------------------------------------- BasePolicy API
+    # ----------------------------------------------------------------- PPO
+    def _encoded_obs(self, obs: dict) -> tuple[torch.Tensor, torch.Tensor]:
+        """(images [B,1,3,64,64] in [-1,1], states [B,8]) on the heads' device."""
+        obs = self._as_internal(obs)
+        device = next(self.actor_image_encoder.parameters()).device
+        images = self._preprocess_dsrl_images(obs["images"]).to(
+            device=device, dtype=_DSRL_DTYPE
+        )
+        states = self._preprocess_states(obs["states"]).to(device=device)
+        return images, states
+
+    def _noise_normal(self, images, states) -> torch.distributions.Normal:
+        """The pre-tanh Gaussian of the noise policy, elementwise [B, noise_dim]."""
+        features = torch.cat(
+            [self.actor_state_encoder(states), self.actor_image_encoder(images)], dim=-1
+        )
+        dist = self.dsrl_action_noise_net.forward(features)
+        # SquashedNormal = tanh(Independent(Normal)); the Normal is what PPO needs.
+        return dist.base_dist.base_dist
+
+    @staticmethod
+    def _tanh_logprobs(normal, pre_tanh: torch.Tensor) -> torch.Tensor:
+        """Per-element log-prob of z = tanh(u) under the squashed Gaussian."""
+        z = torch.tanh(pre_tanh)
+        return normal.log_prob(pre_tanh) - torch.log(1 - z.pow(2) + 1e-7)
+
+    def default_forward(
+        self,
+        forward_inputs,
+        compute_logprobs=True,
+        compute_entropy=False,
+        compute_values=False,
+        **kwargs,
+    ):
+        """PPO recompute on stored rollout inputs.
+
+        Returns per-element ``logprobs`` [B, noise_dim] (``logprob_type``
+        decides the aggregation), Gaussian ``entropy`` per element, and
+        ``values`` [B, 1] from the value head.
+        """
+        images, states = self._encoded_obs(
+            {
+                "extra_view_images": forward_inputs["extra_view_images"],
+                "states": forward_inputs["states"],
+            }
+        )
+        normal = self._noise_normal(images, states)
+        pre_tanh = forward_inputs["pre_tanh"].to(
+            device=images.device, dtype=_DSRL_DTYPE
+        )
+        out = {"logprobs": self._tanh_logprobs(normal, pre_tanh)}
+        if compute_entropy:
+            out["entropy"] = normal.entropy()
+        if compute_values:
+            out["values"] = self.value_head(images, states)
+        return out
+
     def forward(self, forward_type=ForwardType.DEFAULT, **kwargs):
         if forward_type == ForwardType.SAC:
             return self.sac_forward(**kwargs)
@@ -403,18 +507,14 @@ class FlexPiPolicy(BasePolicy, nn.Module):
             return self.default_forward(**kwargs)
         raise NotImplementedError(f"FlexPiPolicy has no forward for {forward_type}")
 
-    def default_forward(self, **kwargs):
-        raise NotImplementedError(
-            "FlexPiPolicy trains with DSRL only (loss_type: embodied_sac); "
-            "use forward_type SAC / SAC_Q."
-        )
-
     def predict_action_batch(self, env_obs=None, mode: str = "train", **kwargs):
-        """DSRL rollout step, mirroring OpenPI: SAC samples noise, FlexPi denoises it.
+        """Rollout step: the noise policy samples z, FlexPi denoises it.
 
-        ``actions`` go to the env; ``forward_inputs["action"]`` is the NOISE, which
-        is what SAC trains on. ``model_action`` keeps the denoised chunk for logging.
+        ``actions`` go to the env; ``forward_inputs["action"]`` is the NOISE,
+        which is what RL trains on. ``model_action`` keeps the denoised chunk.
         """
+        if self.add_value_head:
+            return self._predict_ppo(env_obs, mode)
         noise, noise_logprob, _ = self.sac_forward(env_obs, train=False, mode=mode)
         outputs = self.sample_actions(env_obs, noise=noise)
         actions = outputs["actions"]
@@ -431,6 +531,32 @@ class FlexPiPolicy(BasePolicy, nn.Module):
             # target, so the reward-level bootstrap the env worker adds on
             # truncation must be 0 or the value is counted twice.
             "prev_values": torch.zeros(B, 1, dtype=torch.float32),
+        }
+        return actions, result
+
+    @torch.no_grad()
+    def _predict_ppo(self, env_obs: dict, mode: str):
+        images, states = self._encoded_obs(env_obs)
+        normal = self._noise_normal(images, states)
+        pre_tanh = normal.loc if mode == "eval" else normal.rsample()
+        noise = torch.tanh(pre_tanh)
+        logprobs = self._tanh_logprobs(normal, pre_tanh)  # [B, noise_dim]
+        values = self.value_head(images, states)  # [B, 1]
+        outputs = self.sample_actions(env_obs, noise=noise.to(torch.float32))
+        actions = outputs["actions"]
+        B = actions.shape[0]
+        forward_inputs = {
+            "action": noise.detach().to(torch.float32).reshape(B, -1).contiguous(),
+            "pre_tanh": pre_tanh.detach().to(torch.float32).contiguous(),
+            "model_action": actions.reshape(B, -1).contiguous(),
+            # What default_forward needs to recompute log-probs and values.
+            "extra_view_images": env_obs["extra_view_images"],
+            "states": env_obs["states"],
+        }
+        result = {
+            "forward_inputs": forward_inputs,
+            "prev_logprobs": logprobs.detach().to(torch.float32).contiguous(),
+            "prev_values": values.detach().to(torch.float32).contiguous(),
         }
         return actions, result
 
