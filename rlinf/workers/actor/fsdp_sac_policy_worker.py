@@ -372,15 +372,17 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         bootstrap_type = self.cfg.algorithm.get("bootstrap_type", "standard")
         agg_q = self.cfg.algorithm.get("agg_q", "min")
         use_dsrl = _is_dsrl(self.cfg)
+        # One transition is one action chunk; its reward is the sum over the
+        # chunk's steps and the discount spans the chunk. Reading only the
+        # first step's reward here dropped every reward that landed mid-chunk.
+        rewards_for_bootstrap = (
+            batch["rewards"].sum(dim=-1, keepdim=True).to(self.torch_dtype)
+        )
         if use_dsrl:
             num_action_chunks = self.cfg.actor.model.get("num_action_chunks", 1)
             discount = self.cfg.algorithm.gamma**num_action_chunks
-            rewards_for_bootstrap = batch["rewards"][:, 0:1].to(self.torch_dtype)
         else:
             discount = self.cfg.algorithm.gamma
-            rewards_for_bootstrap = (
-                batch["rewards"].sum(dim=-1, keepdim=True).to(self.torch_dtype)
-            )
         terminations = batch["terminations"].to(self.torch_dtype)
 
         curr_obs = batch["curr_obs"]
