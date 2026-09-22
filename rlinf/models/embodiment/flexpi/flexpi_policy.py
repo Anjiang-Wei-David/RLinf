@@ -119,6 +119,7 @@ class FlexPiPolicy(BasePolicy, nn.Module):
         use_dsrl: true          # SAC only: tells the SAC worker to train the noise policy
         add_q_head: true        # SAC heads; false for PPO
         add_value_head: false   # PPO value head; true for PPO
+        eval_sample_noise: false  # eval uses the policy mean; true samples instead
         num_action_chunks: 32   # FlexPi action horizon; the noise is [32, action_dim]
         action_dim: 8           # arm joints (7) + gripper (1)
         flexpi:
@@ -322,7 +323,9 @@ class FlexPiPolicy(BasePolicy, nn.Module):
         features = torch.cat(
             [self.actor_state_encoder(states), self.actor_image_encoder(images)], dim=-1
         )
-        deterministic = kwargs.get("mode", "train") == "eval"
+        deterministic = kwargs.get("mode", "train") == "eval" and not self.cfg.get(
+            "eval_sample_noise", False
+        )
         noise, logprobs = self.dsrl_action_noise_net.sample(
             features, deterministic=deterministic
         )
@@ -538,7 +541,8 @@ class FlexPiPolicy(BasePolicy, nn.Module):
     def _predict_ppo(self, env_obs: dict, mode: str):
         images, states = self._encoded_obs(env_obs)
         normal = self._noise_normal(images, states)
-        pre_tanh = normal.loc if mode == "eval" else normal.rsample()
+        deterministic = mode == "eval" and not self.cfg.get("eval_sample_noise", False)
+        pre_tanh = normal.loc if deterministic else normal.rsample()
         noise = torch.tanh(pre_tanh)
         logprobs = self._tanh_logprobs(normal, pre_tanh)  # [B, noise_dim]
         values = self.value_head(images, states)  # [B, 1]

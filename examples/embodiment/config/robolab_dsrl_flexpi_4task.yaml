@@ -166,7 +166,10 @@ env:
     seed: 1000
     rollout_epoch: 1
     total_num_envs: 32
-    auto_reset: True
+    # One episode per env per epoch: a finished env holds until the epoch
+    # ends instead of starting another attempt (which would inflate
+    # success_once for tasks with a short time limit).
+    auto_reset: False
     ignore_terminations: True
     use_rel_reward: False
     use_step_penalty: False
