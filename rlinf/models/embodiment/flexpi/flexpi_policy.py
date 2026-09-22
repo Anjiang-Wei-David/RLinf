@@ -38,8 +38,11 @@ from __future__ import annotations
 
 import importlib.util
 import inspect
+import math
 import os
+import random
 import sys
+import types
 from pathlib import Path
 from typing import Optional
 
@@ -71,6 +74,75 @@ def _load_serving_module(eval_dir: str):
     sys.modules["flexpi_serving"] = mod
     spec.loader.exec_module(mod)
     return mod
+
+
+class _FlowSDE:
+    """Scheduler stand-in that makes one denoising step stochastic (OpenPI's
+    ``flow_sde`` with sigma = t / num_train_timesteps).
+
+    FlexPi's loop calls ``scheduler.step(v, delta, x)`` once per step. In
+    ``sample`` mode every step is Euler except step ``k``, where Gaussian noise
+    of std ``sqrt(delta) * noise_level * sqrt(sigma / (1 - sigma))`` is added;
+    the latent chain and the per-element log-prob of that step are recorded.
+    In ``recompute`` mode the recorded chain is replayed and the log-prob of
+    ``chain[k + 1]`` under the current velocity is returned, with gradients.
+    Latents are recorded in the model's dtype so a recompute sees exactly the
+    inputs the sampler used. Everything else is delegated to the real scheduler.
+    """
+
+    def __init__(self, orig, sigmas, k, noise_level, mode, chain=None):
+        self.orig = orig
+        self.s = sigmas.float()
+        self.k = int(k)
+        self.nl = float(noise_level)
+        self.mode = mode
+        self.chain = [] if chain is None else list(chain)
+        self.i = 0
+        self.logp = None
+
+    def __getattr__(self, name):
+        return getattr(self.orig, name)
+
+    def _mean_std(self, v, x, i):
+        s = self.s[i]
+        d = s - self.s[i + 1]
+        x0 = x - v * s
+        x1 = x + v * (1 - s)
+        if i == self.k:
+            s_den = self.s[1] if s >= 1 else s  # the first step has sigma = 1
+            sig = self.nl * torch.sqrt(s_den / (1 - s_den))
+            mean = x0 * (1 - (s - d)) + x1 * (s - d - sig**2 * d / (2 * s))
+            std = torch.sqrt(d) * sig
+        else:
+            mean = x0 * (1 - (s - d)) + x1 * (s - d)
+            std = torch.zeros((), device=x.device)
+        return mean.float(), std.float()
+
+    @staticmethod
+    def _logp(x, mean, std):
+        return (
+            -torch.log(std)
+            - 0.5 * math.log(2 * math.pi)
+            - 0.5 * ((x - mean) / std) ** 2
+        )
+
+    def step(self, v, delta, x):
+        i = self.i
+        self.i += 1
+        if self.mode == "sample":
+            if i == 0:
+                self.chain.append(x.detach().float().clone())
+            mean, std = self._mean_std(v.float(), x.float(), i)
+            x_next = mean + std * torch.randn_like(mean) if i == self.k else mean
+            x_next = x_next.to(x.dtype)
+            if i == self.k:
+                self.logp = self._logp(x_next.float(), mean, std)
+            self.chain.append(x_next.detach().float().clone())
+            return x_next
+        if i == self.k:
+            mean, std = self._mean_std(v.float(), self.chain[i].to(x.device), i)
+            self.logp = self._logp(self.chain[i + 1].to(x.device), mean, std)
+        return self.chain[i + 1].to(device=x.device, dtype=x.dtype)
 
 
 class _ValueHead(nn.Module):
@@ -121,6 +193,9 @@ class FlexPiPolicy(BasePolicy, nn.Module):
         add_value_head: false   # PPO value head; true for PPO
         eval_sample_noise: false  # eval uses the policy mean; true samples instead
         noise_scale: 1.0        # latent range = scale * tanh(.)
+        train_flexpi: false     # flow-matching PPO on the ActionDiT itself (plan B)
+        flow_rl: {noise_level: 0.5, ignore_last: true}
+        prompts: [...]          # flow mode: task prompts, indexed in the rollout batch
         num_action_chunks: 32   # FlexPi action horizon; the noise is [32, action_dim]
         action_dim: 8           # arm joints (7) + gripper (1)
         flexpi:
@@ -164,29 +239,39 @@ class FlexPiPolicy(BasePolicy, nn.Module):
         # twice (model + target) from the same config and never denoises.
         self._device = device
         self.serving = None
+        # Flow-matching PPO: FlexPi's ActionDiT itself is the trained policy.
+        # One denoising step is made stochastic per chunk; the actor trains
+        # the log-prob of that step. The backbone stays frozen.
+        self.train_flexpi = bool(cfg.get("train_flexpi", False))
+        flow_rl = cfg.get("flow_rl", {}) or {}
+        self.flow_noise_level = float(flow_rl.get("noise_level", 0.5))
+        self.flow_ignore_last = bool(flow_rl.get("ignore_last", True))
+        # Prompts travel through the rollout batch as indices into this table.
+        self.prompts = [str(x) for x in (cfg.get("prompts", []) or [])]
+        self._flow_sigmas = None
 
-        # DSRL heads, wired exactly as OpenPI's use_dsrl path. The Q-head sees
-        # the whole flattened latent, not a first timestep: with a 32x8 latent
-        # the first row would be 3 % of what the noise policy chose.
         state_lat = int(cfg.get("dsrl_state_latent_dim", 64))
         image_lat = int(cfg.get("dsrl_image_latent_dim", 64))
         hidden = tuple(cfg.get("dsrl_hidden_dims", [128, 128, 128]))
         self.dsrl_state_dim = int(cfg.get("dsrl_state_dim", 8))
-        self.dsrl_action_noise_net = GaussianPolicy(
-            input_dim=state_lat + image_lat,
-            output_dim=self.noise_dim,
-            hidden_dims=hidden,
-            low=-self.noise_scale,
-            high=self.noise_scale,
-            action_horizon=1,
-        ).to(dtype=_DSRL_DTYPE)
-        self.actor_image_encoder = LightweightImageEncoder64(
-            num_images=1, latent_dim=image_lat, image_size=64
-        ).to(dtype=_DSRL_DTYPE)
-        self.actor_state_encoder = CompactStateEncoder(
-            state_dim=self.dsrl_state_dim, hidden_dim=state_lat
-        ).to(dtype=_DSRL_DTYPE)
-        self.add_q_head = bool(cfg.get("add_q_head", True))
+        if not self.train_flexpi:
+            # Noise-space heads (DSRL / PPO over the initial latent), wired as
+            # OpenPI's use_dsrl path. The Q-head sees the whole flattened latent.
+            self.dsrl_action_noise_net = GaussianPolicy(
+                input_dim=state_lat + image_lat,
+                output_dim=self.noise_dim,
+                hidden_dims=hidden,
+                low=-self.noise_scale,
+                high=self.noise_scale,
+                action_horizon=1,
+            ).to(dtype=_DSRL_DTYPE)
+            self.actor_image_encoder = LightweightImageEncoder64(
+                num_images=1, latent_dim=image_lat, image_size=64
+            ).to(dtype=_DSRL_DTYPE)
+            self.actor_state_encoder = CompactStateEncoder(
+                state_dim=self.dsrl_state_dim, hidden_dim=state_lat
+            ).to(dtype=_DSRL_DTYPE)
+        self.add_q_head = bool(cfg.get("add_q_head", True)) and not self.train_flexpi
         self.add_value_head = bool(cfg.get("add_value_head", False))
         if self.add_q_head:
             self.critic_image_encoder = LightweightImageEncoder64(
@@ -210,10 +295,234 @@ class FlexPiPolicy(BasePolicy, nn.Module):
                 image_latent_dim=image_lat,
                 hidden_dims=hidden,
             ).to(dtype=_DSRL_DTYPE)
+        if self.train_flexpi:
+            # Both workers hold FlexPi from the start: the actor trains its
+            # ActionDiT, the rollout denoises with it, and weight sync moves the
+            # registered `action_expert` between them by name.
+            self._load_serving(cfg.flexpi, device)
+            self._install_flow_patches(self.serving.model)
+            self.action_expert = self.serving.model.action_expert
+            if str(cfg.get("precision", "bf16")).lower() in ("fp32", "32", "float32"):
+                # fp32 master weights on the actor; FSDP mixed precision casts
+                # to bf16 for compute, matching the rollout's bf16 model.
+                self.action_expert.float()
+            for p in self.action_expert.parameters():
+                p.requires_grad_(True)
         for name, module in self.named_modules():
             setattr(module, "_fsdp_wrap_name", name.split(".")[-1] if name else name)
         self.global_step = 0
         self.torch_compile_enabled = False
+
+    # ------------------------------------------------------------ flow PPO
+    @staticmethod
+    def _install_flow_patches(model) -> None:
+        """Make the inference path usable for training on this instance.
+
+        Tao's entry points are ``@torch.no_grad`` and the per-step velocity
+        prefers a compiled CUDA-graph branch; the grad-safe eager velocity he
+        provides (``_predict_action_grad_safe``) is the same math. The frozen
+        parts build no autograd graph because nothing in them requires grad.
+        """
+        cls = type(model)
+        model.infer_action = types.MethodType(cls.infer_action.__wrapped__, model)
+        model._base_infer_action = types.MethodType(
+            cls._base_infer_action.__wrapped__, model
+        )
+        model._predict_action_noise_with_cache = model._predict_action_grad_safe
+
+    def _sigmas(self) -> torch.Tensor:
+        """Noise fractions of the inference schedule, [n_steps + 1], ending at 0."""
+        if self._flow_sigmas is None:
+            s = self.serving
+            sched = s.model.infer_action_scheduler
+            t, _ = sched.build_inference_schedule(
+                num_inference_steps=s.num_inference_steps,
+                device=s.model.device,
+                dtype=torch.float32,
+            )
+            self._flow_sigmas = torch.cat(
+                [t / sched.num_train_timesteps, torch.zeros(1, device=t.device)]
+            )
+        return self._flow_sigmas
+
+    def _infer_kwargs(
+        self, canvas_u8: np.ndarray, state8: np.ndarray, prompt: str
+    ) -> dict:
+        """The keyword arguments of one serving inference call (batch 1)."""
+        s = self.serving
+        cams = s._split_composed(canvas_u8)
+        per_cam = s._per_cam(cams)
+        return {
+            "prompt": str(prompt),
+            "input_image": s._compose(per_cam),
+            "per_cam": per_cam,
+            "action_horizon": s.action_horizon,
+            "num_video_frames": s.num_video_frames,
+            "proprio": s._norm_proprio(state8),
+            "negative_prompt": "",
+            "text_cfg_scale": s.text_cfg_scale,
+            "num_inference_steps": s.num_inference_steps,
+            "seed": s._seed,
+            "joint_video": s.joint_video,
+            "joint_dino": s.joint_dino,
+            "joint_pointmap": s.joint_pointmap,
+            "return_stream_latents": False,
+        }
+
+    def _with_stepper(self, stepper, kwargs, skip_all_but: Optional[int] = None):
+        """Run one inference with ``stepper`` in place of the scheduler.
+
+        ``skip_all_but=k`` short-circuits the velocity at every other step (the
+        stepper replays the chain there), so a recompute costs the prefill plus
+        one ActionDiT evaluation.
+        """
+        m = self.serving.model
+        orig_sched, orig_pred = m.infer_action_scheduler, m._cfg_action_prediction
+        counter = {"i": 0}
+
+        def lazy_pred(**kw):
+            i = counter["i"]
+            counter["i"] += 1
+            if skip_all_but is not None and i != skip_all_but:
+                return torch.zeros_like(kw["latents_action"])
+            return orig_pred(**kw)
+
+        m.infer_action_scheduler = stepper
+        m._cfg_action_prediction = lazy_pred
+        # Under FSDP mixed precision the ActionDiT's parameters are already
+        # bf16 views inside forward; standalone (fp32 master weights, no FSDP)
+        # autocast supplies the same bf16 compute.
+        autocast = torch.autocast(
+            device_type="cuda",
+            dtype=m.torch_dtype,
+            enabled=next(self.action_expert.parameters()).dtype != m.torch_dtype,
+        )
+        try:
+            z0 = torch.randn(
+                (1, self.action_horizon, self.action_dim), device=m.device
+            ).to(m.torch_dtype)
+            with autocast:
+                return m.infer_action(**kwargs, latents_action=z0)
+        finally:
+            m.infer_action_scheduler = orig_sched
+            m._cfg_action_prediction = orig_pred
+
+    def _prompt_ids(self, prompts) -> torch.Tensor:
+        ids = []
+        for p in prompts:
+            if str(p) not in self.prompts:
+                raise ValueError(
+                    f"prompt {p!r} is not in actor.model.prompts; the actor recomputes "
+                    "log-probs from a prompt index, so every task prompt must be listed."
+                )
+            ids.append(self.prompts.index(str(p)))
+        return torch.tensor(ids, dtype=torch.long)
+
+    @torch.no_grad()
+    def _predict_flow(self, env_obs: dict, mode: str):
+        s = self.serving
+        canvases, states, prompts = (
+            env_obs["main_images"],
+            env_obs["states"],
+            env_obs["task_descriptions"],
+        )
+        B = canvases.shape[0]
+        n = s.num_inference_steps
+        if mode == "eval":
+            k = -1  # deterministic: plain Euler, Tao's inference
+        else:
+            k = random.randint(0, n - 2 if self.flow_ignore_last else n - 1)
+        actions, chains, logps = [], [], []
+        for b in range(B):
+            kw = self._infer_kwargs(
+                canvases[b].detach().cpu().numpy().astype(np.uint8),
+                states[b].detach().cpu().float().numpy().astype(np.float32),
+                prompts[b],
+            )
+            st = _FlowSDE(
+                s.model.infer_action_scheduler,
+                self._sigmas(),
+                k,
+                self.flow_noise_level,
+                "sample",
+            )
+            pred = self._with_stepper(st, kw)
+            actions.append(
+                torch.from_numpy(s._denorm_action(pred["action"]).astype(np.float32))
+            )
+            chains.append(
+                torch.stack(st.chain, dim=0)[:, 0].cpu()
+            )  # [n+1, horizon, dim]
+            logps.append(
+                st.logp[0].cpu()
+                if st.logp is not None
+                else torch.zeros(self.action_horizon, self.action_dim)
+            )
+        actions = torch.stack(actions, dim=0)  # [B, horizon, dim]
+        images, st_enc = self._encoded_obs(env_obs)
+        values = self.value_head(images, st_enc)
+        forward_inputs = {
+            "action": actions.reshape(B, -1).contiguous(),
+            "chains": torch.stack(chains, dim=0).contiguous(),
+            "denoise_inds": torch.full((B,), k, dtype=torch.long),
+            "prompt_ids": self._prompt_ids(prompts),
+            "main_images": env_obs["main_images"],
+            "states": env_obs["states"],
+            "extra_view_images": env_obs["extra_view_images"],
+        }
+        result = {
+            "forward_inputs": forward_inputs,
+            "prev_logprobs": torch.stack(logps, dim=0).reshape(B, -1).contiguous(),
+            "prev_values": values.detach().to(torch.float32).cpu().contiguous(),
+        }
+        return actions, result
+
+    def _flow_forward(
+        self, forward_inputs, compute_entropy=False, compute_values=False
+    ):
+        """PPO recompute for flow mode: per-element log-probs of the recorded step."""
+        s = self.serving
+        chains, ks, pids = (
+            forward_inputs["chains"],
+            forward_inputs["denoise_inds"],
+            forward_inputs["prompt_ids"],
+        )
+        canvases, states = forward_inputs["main_images"], forward_inputs["states"]
+        B = chains.shape[0]
+        logps = []
+        for b in range(B):
+            k = int(ks[b])
+            kw = self._infer_kwargs(
+                canvases[b].detach().cpu().numpy().astype(np.uint8),
+                states[b].detach().cpu().float().numpy().astype(np.float32),
+                self.prompts[int(pids[b])],
+            )
+            st = _FlowSDE(
+                s.model.infer_action_scheduler,
+                self._sigmas(),
+                k,
+                self.flow_noise_level,
+                "recompute",
+                # the chain is stored per sample without the batch axis
+                chain=[c.to(s.model.device)[None] for c in chains[b]],
+            )
+            self._with_stepper(st, kw, skip_all_but=k)
+            logps.append(st.logp)
+        logprobs = torch.stack(logps, dim=0).reshape(B, -1)
+        out = {"logprobs": logprobs}
+        if compute_entropy:
+            out["entropy"] = torch.zeros_like(
+                logprobs
+            )  # std does not depend on the weights
+        if compute_values:
+            images, st_enc = self._encoded_obs(
+                {
+                    "extra_view_images": forward_inputs["extra_view_images"],
+                    "states": states,
+                }
+            )
+            out["values"] = self.value_head(images, st_enc)
+        return out
 
     def _load_serving(self, fp: DictConfig, device: str) -> None:
         """Load Tao's frozen FlexPi through his serving class (rollout side only)."""
@@ -248,7 +557,11 @@ class FlexPiPolicy(BasePolicy, nn.Module):
     def _require_serving(self):
         if self.serving is None:
             self._load_serving(self.cfg.flexpi, self._device)
-            if bool(self.cfg.flexpi.get("warmup", True)) and torch.cuda.is_available():
+            if (
+                not self.train_flexpi
+                and bool(self.cfg.flexpi.get("warmup", True))
+                and torch.cuda.is_available()
+            ):
                 self._warmup()
         return self.serving
 
@@ -453,7 +766,8 @@ class FlexPiPolicy(BasePolicy, nn.Module):
     def _encoded_obs(self, obs: dict) -> tuple[torch.Tensor, torch.Tensor]:
         """(images [B,1,3,64,64] in [-1,1], states [B,8]) on the heads' device."""
         obs = self._as_internal(obs)
-        device = next(self.actor_image_encoder.parameters()).device
+        ref = self.value_head if self.train_flexpi else self.actor_image_encoder
+        device = next(ref.parameters()).device
         images = self._preprocess_dsrl_images(obs["images"]).to(
             device=device, dtype=_DSRL_DTYPE
         )
@@ -492,6 +806,8 @@ class FlexPiPolicy(BasePolicy, nn.Module):
         decides the aggregation), Gaussian ``entropy`` per element, and
         ``values`` [B, 1] from the value head.
         """
+        if self.train_flexpi:
+            return self._flow_forward(forward_inputs, compute_entropy, compute_values)
         images, states = self._encoded_obs(
             {
                 "extra_view_images": forward_inputs["extra_view_images"],
@@ -524,6 +840,8 @@ class FlexPiPolicy(BasePolicy, nn.Module):
         ``actions`` go to the env; ``forward_inputs["action"]`` is the NOISE,
         which is what RL trains on. ``model_action`` keeps the denoised chunk.
         """
+        if self.train_flexpi:
+            return self._predict_flow(env_obs, mode)
         if self.add_value_head:
             return self._predict_ppo(env_obs, mode)
         noise, noise_logprob, _ = self.sac_forward(env_obs, train=False, mode=mode)
